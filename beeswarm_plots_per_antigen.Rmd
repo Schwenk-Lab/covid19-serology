@@ -1,0 +1,237 @@
+---
+title: "Beeswarm plots per antigen"
+author: "Creator: Tea Dodig-Crnkovic. Contributors: Mun-Gwan Hong, Cecilia Engel Thomas, Tea Dodig-Crnkovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false 
+
+---
+<!-- highlight: textmate -->
+
+<!-- Edit TOC style (background color) -->
+<style>
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    background-color: #EAEAEA;
+    color: black;}
+</style>
+
+<!-- Set background color for highlighted text -->
+<style>
+div.highlight { 
+  background-color: #EAEAEA;  <!-- #39AC91 (turquoise) -->
+  color: #FFFFEF;
+  padding: 10px;
+  border-radius: 2px 2px 2px 2px;}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy=FALSE)
+```
+
+
+<style type="text/css">
+
+h1.title {
+  font-size: 22px;
+}
+h1 { /* Header 1 */
+  font-size: 20px;
+}
+h2 { /* Header 2 */
+    font-size: 18px;
+}
+h3 { /* Header 3 */
+  font-size: 12px;
+}
+
+</style>
+
+  
+# Initialization
+```{r eval=T, warning=F, message=FALSE}
+
+# Empty global environment
+rm(list = ls(all.names = TRUE))
+
+```
+
+## Load global options
+```{r eval=T, warning=F, message=FALSE}
+
+# set global options
+source("options_master_trans_serology.R")
+
+#if there was a global data set defined, use that 
+if(global_data_set != "no_global_data_set_defined") { 
+  data_set = global_data_set 
+  
+  #otherwise use a localy defined data set, this option is primarily used for individual testing of the analysis scripts  
+} else { 
+  data_set = "batch2" 
+} 
+
+# get path for chosen data set
+data_file_path = get_data_set_path(data_set)[[1]]
+exp_method = get_data_set_path(data_set)[[2]]
+
+# load data
+load(data_file_path)
+
+# output directory
+out_dir <- paste0("../results/beeswarms_per_ag/", data_set, "/", exp_method, "/")
+
+# set plot day (today)
+plot_date <- format(Sys.time(),"%Y-%m-%d")
+
+
+```
+
+```{r eval=T, warning=F, message=FALSE}
+# Load packages
+library(tidyverse)
+library(ggbeeswarm)
+library(reshape2)
+library(ggforce)
+library(scales)
+
+options(stringsAsFactors = FALSE)
+
+# exclude bindeders according to list from 2020-06-10
+excl <- c(grep("PEP", binder$Name),
+          grep("GPE", binder$Name),
+          grep("IGA", binder$Name),
+          grep("ACE",  binder$Name),
+          grep("BBD",  binder$Name),
+          grep("NTR",  binder$Name))
+
+if(data_set == "batch1"){
+  
+  excl <- c(excl,
+            c(grep("IGM_03", binder$Name),
+              grep("IGM_04", binder$Name),
+              grep("PRS", binder$Name),
+              grep("NBT", binder$Name)))
+  
+}
+
+binder <- binder[-excl, ]
+mfi <- mfi[, intersect(colnames(mfi), binder$id)]
+
+# Make uniqe Name + detection ab
+binder$Name_detect_Ab <- paste0(binder$Name, "_", binder$detect_Ab)
+
+# Melt mfi to long format and 
+# create column with unique identifier (sample.antigen)
+df <- melt(mfi, value.name = "mfi") %>% 
+  unite("unique.id", Var1:Var2, sep=".", remove = FALSE)
+
+
+# Rename columns
+df <-
+  df %>% rename("sample.id" = "Var1",
+                "protein.id" = "Var2")
+
+sinfo <-
+  sinfo %>% rename("sample.id" = "id")
+
+binder <-
+  binder %>% rename("protein.id" = "id")
+
+
+# Merge with protein and sample information
+df$protein.id <- as.character(df$protein.id)
+df$sample.id <- as.character(df$sample.id)
+
+df <-
+  left_join(df, binder, by="protein.id")
+
+df <-
+  left_join(df, sinfo, by="sample.id")
+
+# Exclude samples that
+#   *) Update 2020-04-29: only include DBS samples 
+#   *) Blood spot not OK
+
+df <- df[df$sample.id %in% sinfo$sample.id[sinfo$sample_type == "DBS"],]
+
+exl <- c(sinfo$sample.id[sinfo$sample_type == "DBS" & sinfo$Nr_OK_spots == 0]) %>% unique()
+
+df <- df[!df$sample.id %in% exl, ]
+
+
+
+```
+
+
+# Generate MFI plots
+```{r results = "hide"}
+
+# Color by sample type
+
+# split plottong by detection antibody
+for(det_Ab in unique(binder$detect_Ab)){
+  
+pdf(paste0(out_dir,
+           format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+           "_", data_set, "_beeswarm_panel_mfi_", det_Ab, ".pdf"),
+    width=12,height=8, useDingbats=F)
+  
+  plot_list <- list(1:length(unique(binder$protein.id[binder$detect_Ab == det_Ab])))
+
+# Specify how many plot to do per page
+ncol_n <- 4
+nrow_n <- 3
+
+n_pages_needed <-
+  ceiling(length(unique(df$Name_detect_Ab[df$detect_Ab == det_Ab]))/(ncol_n*nrow_n))
+
+
+for (i in seq_len(n_pages_needed)) {
+
+  # select protein name and detection Ab
+  protein <- unique(df$Name_detect_Ab[df$detect_Ab == det_Ab])
+  df_plot <- df[df$Name_detect_Ab %in% protein,]
+  
+
+  # Exclude NaN
+  df_plot <- df_plot[complete.cases(df_plot$mfi), ]
+
+  # Save panel of plots to list per page
+  plot_list[[i]] <-
+    ggplot(transform(df_plot, 
+                     Name_detect_Ab = factor(Name_detect_Ab, levels= sort(protein))), #sort by alphabetical name
+           aes(x = 0, y = mfi, color= sample_type)) +
+    geom_beeswarm(cex=1.5, alpha=0.4, priority = "none") +
+    xlab("") +
+    ylab("MFI[AU]") +
+    theme_bw() +
+    #scale_y_continuous(trans = 'log2, breaks = log_breaks())
+    theme(axis.ticks.x = element_blank(),
+          axis.text.x = element_blank()) +
+    labs(caption = paste0("Plot date: ", plot_date,
+                          "\nInput data: ", data_set)) +
+    facet_wrap_paginate(~Name_detect_Ab, 
+                        ncol = ncol_n, nrow = nrow_n, page = i,
+                        strip.position="top", scales="free_y") +
+     scale_color_manual(values=c("black"))
+  
+ print(plot_list[[i]])
+  
+}
+  
+  dev.off()
+}
+
+
+```
+
+
+
+# Session information
+```{r session_info, eval=T, echo=F}
+sessionInfo()
+
+```

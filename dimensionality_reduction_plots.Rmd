@@ -1,0 +1,765 @@
+---
+title: "Dimensionality reduction of Luminex data"
+author: "Creator: Cecilia Engel Thomas. Contributors: Mun-Gwan Hong, Tea Dodig-Crnkovic, Cecilia Engel Thomas"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+
+
+# Initialization
+
+```{r packages, eval=t, echo=F}
+
+library(ggplot2)
+library(DT)
+library(umap)
+library(stringr)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
+library(patchwork)
+
+```
+
+```{r initialization, eval=T, warning=F}
+
+rm(list=ls())
+
+options(stringsAsFactors = FALSE)
+
+
+```
+
+## Load global options
+
+<details><summary>Click here to see options</summary>
+```{r engine='bash', comment=''}
+
+#display code from global options
+cat options_master_trans_serology.R
+```
+</details>
+
+
+```{r global_options, eval=T}
+
+#also sourcing as otherwise the script doesn't work when running the code from R studio as opposed to rendering the report. For rendering this is not neccessary.
+source("options_master_trans_serology.R")
+
+#--- Define which data set to run analysis on
+
+#if there was a global data set defined, use that
+if(global_data_set != "no_global_data_set_defined") {
+  data_set = global_data_set
+  
+#otherwise use a localy defined data set, this option is primarily used for individual testing of the analysis scripts 
+} else {
+  data_set = "cbc03"
+}
+
+#--- Define which detection antibodies to include in analysis
+
+#if there was a setting, use that
+if(global_data_set != "no_global_detection_ab_defined") {
+  detection_ab = global_detection_ab
+  
+#otherwise use a localy setting, this option is primarily used for individual testing of the analysis scripts 
+} else {
+  detection_ab = "IgG_IgM"
+}
+
+#--- Get path for chosen data set
+data_file_path = get_data_set_path(data_set)[[1]]
+exp_method = get_data_set_path(data_set)[[2]]
+
+#--- Define output directory
+out_dir = paste0("../results/dim_reduction_plots/", data_set, "/", exp_method, "/")
+
+```
+
+## Local options
+
+If data is cbc03 then:   
+- Data is log2 transformed.   
+- All samples except buffer are included (as there are also plasma samples etc in this data set which we want to include).   
+- Antibodies targeting CoV proteins (not peptides) are included as well as controls.   
+
+If data is batch1 or batch2 then:   
+- Data is not transformed as it is assumed that this has already been done.   
+- Only samples that have been on DBS are included.   
+- Only antibodies targeting CoV related proteins (not peptides) are included.   
+
+
+```{r local_options}
+
+# Options
+if(data_set == "cbc03"){
+  transformation = "log2"
+  samples_to_include = "All except buffer"   #"Only DBS from random sampling", "All samples that have been on DBS", "All samples", "All except buffer"
+  binders_to_include = "CoV, controls, no peptides"  #"all", "CoV, no peptides", "CoV, controls, no peptides"
+} else if (data_set %in% c("batch1","batch2")){
+  transformation = "none"
+  samples_to_include = "All samples that have been on DBS" #"Only DBS from random sampling", "All samples that have been on DBS", "All samples", "All except buffer
+  binders_to_include = "CoV, no peptides"  #"all", "CoV, no peptides", "CoV, controls, no peptides"
+}
+#samples_to_include = "All except buffer"   #"Only DBS from random sampling", "All samples that have been on DBS", "All samples", "All except buffer"
+#binders_to_include = "CoV, controls, no peptides"  #"all", "CoV, no peptides", "CoV, controls, no peptides"
+
+# Plot file prefix
+data_set_name = data_file_path %>% str_split(., "/") %>% unlist() %>% .[length(.)] %>% str_split(., "\\.") %>% unlist() %>% .[1]
+plot_prefix = paste0(out_dir, Sys.Date(), "_dim_red_", data_set_name, "_detectionAb_", detection_ab)
+
+# Plot footnote
+footnote = paste(samples_to_include, paste0("Detection Ab: ", detection_ab), paste0("Included binders: ", binders_to_include), paste0("Transformation: ", transformation), sep=". ")
+
+```
+
+
+
+**Working directory**:   
+*`r getwd()`*   
+
+**All plots generated can be found at**:   
+*`r normalizePath("../results/dim_reduction_plots/")`*  
+
+**Data options**
+
+*Data set*:   
+`r data_set`
+
+*Data set input file*:   
+`r data_file_path`
+
+*Detection antibodies included in analysis*:   
+`r detection_ab`
+
+*Binders included in analysis:*   
+`r binders_to_include`
+
+*Samples included in analysis:*   
+`r samples_to_include`
+
+*Data transformations applied:*   
+`r transformation`
+
+# Read in data
+
+```{r read_data, eval=T}
+
+# MFI, probe info and sample info
+load(data_file_path)
+
+#objects: binder, median_bead_count, mfi, min_bead_count, sinfo
+
+mfi_input = mfi
+
+```
+
+# Remove unwanted samples
+
+Exclude samples that   
+* Blood spot not OK    
+* Only include samples as defined in options (see above)
+
+```{r remove_samples, eval=T}
+
+exclude = c(sinfo$id[sinfo$sample_type == "DBS" & sinfo$Nr_OK_spots == 0]            #DBS samples with no ok blood spot
+            )
+
+#if only "random" DBS samples should be included
+if(samples_to_include == "Only DBS from random sampling") {
+  exclude = c(exclude, sinfo$id[!(sinfo$sample_type %in% c("DBS"))])   #Non DBS saples
+}
+
+#if only DBS samples should be included
+if(samples_to_include == "All samples that have been on DBS") {
+  exclude = c(exclude, sinfo$id[!(sinfo$sample_type %in% c("DBS","DBS from NR", "Serum_DBS", "xDBS"))])   #Non DBS saples
+}
+
+# If all samples but buffer should be included
+if(samples_to_include == "All except buffer") {
+  exclude = sinfo$id[sinfo$sample_type %in% c("Buffer")]  #Buffer
+}
+
+# If data is cbc03, remove replicated samples
+if(data_set == "cbc03"){
+  
+  exclude = c(exclude, sinfo$id %>% grep("\\*", ., value=T))   #Replicated samples
+  exclude = c(exclude, sinfo$id[sinfo$subtype == "xDBS"])   #xDBS saples
+  
+}
+
+samples_to_keep = mfi %>%
+                      rownames() %>%
+                      .[!(. %in% exclude)]
+
+```
+
+**Samples included in analysis**   
+`r sinfo %>%
+    filter(id %in% samples_to_keep) %>%
+    .[,c("id","class","sample_type","Nr_OK_spots")] %>%
+    datatable()`
+
+
+# Filter binders
+
+```{r filter_binders, echo=F}
+
+#--- Filter on detection antibody
+
+if(detection_ab != "all") {
+  
+  #identify which detection antibodies to include
+  abs = detection_ab %>% str_split(., "_") %>% unlist()
+  
+  mfi_input = mfi_input[,
+                binder %>%
+                  filter(detect_Ab %in% abs) %>%
+                  pull(id)
+                ]
+  
+}
+
+#fix names of binders (ggplot doesn't like the * and parenthesis characters)
+colnames(mfi_input) = mfi_input %>% colnames() %>% make.names()
+binder = binder %>%
+          mutate(id = make.names(id))
+
+#--- Filter on binder identity (control, anti-SARS etc.)
+
+binders_to_keep = mfi_input %>% 
+                  colnames()
+
+if(binders_to_include != "all") {
+
+  if(binders_to_include == "CoV, no peptides" | binders_to_include == "CoV, controls, no peptides"){
+    
+    binders_to_keep = mfi_input %>% 
+                  colnames() %>%
+                  grep("CoV", ., value=T) %>%              #Only CoV proteins
+                  grep("Peptide", ., value=T, invert=T)    #No peptides
+      
+  } 
+  if(binders_to_include == "CoV, controls, no peptides"){
+    
+    binders_to_keep = c(binders_to_keep, 
+            mfi_input %>%
+               colnames() %>%
+               grep("anti.human", ., value = T),         #Positive controls
+            mfi_input %>%
+               colnames() %>%
+               grep("Bare.Bead", ., value=T)             #Negative controls
+            )
+    
+  }
+  
+}
+
+```
+
+**Binders included in dimensionality reduction computation**   
+
+`r binder %>%
+    filter(id %in% binders_to_keep) %>%
+    datatable()`
+
+
+# Data transformations
+
+```{r data_transform}
+
+if(transformation == "log2"){
+  
+  mfi_input = mfi_input %>%
+                log2(.)
+  
+}
+
+```
+
+# UMAP function, hyperparameter exploration
+
+Hyperparamaters explored are: 
+n_neighbors: "controls how UMAP balances local versus global structure in the data"   
+min_dist: "controls how tightly UMAP is allowed to pack points together"   
+
+Euclidean distance used as distance metric.
+
+Additionally, 3 repeats are performed for each combination of hyperparameters. Each repeat has a unique, defined seed.
+
+Further information on UMAP hyperparamaters can be found here: "https://umap-learn.readthedocs.io/en/latest/parameters.html"
+
+```{r umap_function}
+
+umap_hyperparam_explo <- function(data, n_neighbors, min_dist, seeds){
+  
+  #list for storing results
+  results = list()
+  
+  #looping over n_neighbors
+  for(n_neigh in n_neighbors) {
+    
+    #looping over min_dist
+    for(m_dist in min_dist) {
+      
+      #lopping over seeds
+      for(s in seeds) {
+        
+        name = paste0("n_neighbors: ", n_neigh, ", min_dist: ", m_dist, ", seed: ", s)
+        
+        results[[name]] = umap(dim_red_input, n_neighbors = n_neigh, min_dist = m_dist, random_state=s)$layout %>% as.data.frame
+        
+      }
+    }
+  }
+  
+  return(results)
+  
+  
+}
+
+```
+
+
+# Compute dimensionality reductions
+
+```{r compute_dimred, echo=F, warning=F}
+
+#list for storing dimensionality reductions
+dim_reds = list()
+
+#data input for dimensionality reduction
+dim_red_input = mfi_input[samples_to_keep, binders_to_keep]
+
+#--- PCA
+
+#samples
+dim_reds[["samples"]][["pca"]][["1"]] = prcomp(na.omit(dim_red_input))$x[,1:2]
+
+#probes
+dim_reds[["probes"]][["pca"]][["1"]] = prcomp(t(na.omit(dim_red_input)))$x[,1:2]
+
+#--- UMAP
+
+#Number of neighbors determined based on number of observations. 
+#This is done since the number of neighbors must be less than the number of observations.
+#Since the number of neighbors must be >1, 1 is added to comply with this.
+
+#samples
+n_neighbors = c(2, ceiling(nrow(dim_red_input)*(1/20))+1, ceiling(nrow(dim_red_input)*(1/3))+1)
+dim_reds[["samples"]][["umap"]] = umap_hyperparam_explo(dim_red_input, n_neighbors=n_neighbors, min_dist=c(0.01,0.1,0.5), seeds=c(42,59,254))
+
+#probes
+n_neighbors = c(2, ceiling(ncol(dim_red_input)*(1/20))+1, ceiling(ncol(dim_red_input)*(1/3))+1)
+dim_reds[["probes"]][["umap"]] = umap_hyperparam_explo(t(dim_red_input), n_neighbors=n_neighbors, min_dist=c(0.01,0.1,0.5), seeds=c(42,59,254))
+
+
+```
+
+# Plots
+
+
+## Samples
+
+```{r plot_samples, echo=T, warning=F}
+
+#--- Variables to color samples by
+
+samp_col_vars = names(sinfo)
+
+#exclude any that are comments
+samp_col_vars = samp_col_vars %>% .[grep("comment", ., ignore.case=T, invert=T)]
+
+#add all probes to color by
+samp_col_vars = c(samp_col_vars, colnames(mfi_input))
+
+#--- If samples are annotated with an ELISA status, make sure all samples from same individual have the same status
+if("elisa.S1" %in% names(sinfo)) {
+  
+  #make elisa.S1 character so that it will be plotted correctly
+  sinfo$elisa.S1 = sinfo$elisa.S1 %>% as.character()
+  
+  #give all samples from same individual same status
+  sinfo = sinfo %>% mutate(elisa.S1 = replace(elisa.S1, 
+                                                subj.id %in% (sinfo %>%
+                                                                    filter(elisa.S1 == "0") %>%
+                                                                    .[,"subj.id"] %>%
+                                                                    unlist()),
+                                                "0")
+                      ) %>%
+                      mutate(elisa.S1 = replace(elisa.S1, 
+                                                subj.id %in% (sinfo %>%
+                                                                    filter(elisa.S1 == "1") %>%
+                                                                    .[,"subj.id"] %>%
+                                                                    unlist()),
+                                                "1")
+                      )
+                      
+  
+  
+
+}
+
+
+#--- Make new variable indicating positive and negative samples
+sinfo <- sinfo %>%
+              mutate(subj_status = subj.id) %>%
+              mutate(subj_status = replace(subj_status, subj_status == "Negative (02)", "Negative")) %>%
+              mutate(subj_status = replace(subj_status, subj_status == "Negative (NR)", "Negative")) %>%
+              mutate(subj_status = replace(subj_status, subj_status == "Negative (SL)", "Negative")) %>%
+              mutate(subj_status = replace(subj_status, subj_status == "Positive (HD)", "Positive")) %>%
+              mutate(subj_status = replace(subj_status, subj_status == "Positive (03)", "Positive")) %>%
+              mutate(subj_status = replace(subj_status, grep("CBC", subj_status), "Population study")) 
+
+if("elisa.S1" %in% names(sinfo)){
+  sinfo %>% 
+  mutate(subj_status = replace(subj_status, elisa.S1 == "1", "Positive")) %>%
+  mutate(subj_status = replace(subj_status, elisa.S1 == "0", "Negative"))
+}
+
+samp_col_vars = c(samp_col_vars, "subj_status")
+
+#--- Plotting
+
+#list for storing plots
+plot_list = list()
+
+#output file for plots
+pdf(file=paste0(plot_prefix, "_samples.pdf"), onefile=T, height=25, width=30)
+
+#loop through variables to plot by
+for(col_var in samp_col_vars){
+
+  pl=list()
+  
+  #loop through dimensionality reduction methods
+  for(method in names(dim_reds[["samples"]])){
+
+    #loop through hyperparameter combinations (only one for PCA)
+    for(hyp_comb in names(dim_reds[["samples"]][[method]])){
+    
+      #define coordinates and add sample info
+      plot_data = dim_reds[["samples"]][[method]][[hyp_comb]] %>%
+                    as_tibble() %>%
+                    rename(., x = 1) %>%
+                    rename(., y = 2) %>%
+                    mutate(id = dim_reds[["samples"]][[method]][[hyp_comb]] %>% rownames()) %>%
+                    left_join(., sinfo, by="id")
+    
+      #add mfi levels
+      plot_data = mfi_input %>%
+                    as_tibble %>%
+                    mutate(id = rownames(mfi_input)) %>%
+                    right_join(., plot_data, by="id")
+      
+      #only make plots colored by col_var if the variable contains non-NA
+      if(!(plot_data[,col_var] %>% is.na() %>% all())){
+      
+        #create plot
+        p <- ggplot(plot_data, aes_string(x="x", y="y", color=col_var, group="subj.id")) +
+          geom_point(alpha=0.4) +
+          labs(title = paste0(toupper(method), ", ", hyp_comb)) +
+          theme_light() +
+          theme(legend.position = "none", 
+                plot.title=element_text(size=8)) +
+          xlab("UMAP1") + ylab("UMAP2")
+        
+        #if variable to color by is subj_status or elisa.S1, use colors defined by global options
+        if(col_var == "subj_status"){
+          cols = c("Negative" = global_color_options["negatives", "color"], 
+                   "Positive" = global_color_options["positives", "color"], 
+                   "Population study" = global_color_options["population_study", "color"])
+          
+          p <- p + scale_color_manual(values = cols)
+          
+        } else if(col_var == "elisa.S1"){
+            cols = c("0" = global_color_options["negatives", "color"], 
+                    "1" = global_color_options["positives", "color"])
+          
+            p <- p + scale_color_manual(values = cols, na.value = "grey")
+        
+        #if col_var is sample_type, also make plots with lines between samples from same subject
+        } else if(col_var == "subtype"){
+          
+          p <- p + geom_path(aes(group=subj.id, color=batch))
+          
+        }
+        
+        #extract if method is PCA
+        if(method == "pca"){
+          p <- p + theme(legend.position="right")
+          leg <- get_legend(p)
+          p <- p + theme(legend.position="none") + xlab("PC1") + ylab("PC2")
+        }
+        
+        
+        p <- ggdraw() + draw_plot(p, x = 0, y = 0, width = 1, height = 1)
+        
+        #save plot
+        plot_name = paste(method, col_var, hyp_comb)
+        plot_list[["samples"]][[plot_name]] = p
+        plot_list[["samples"]][[paste0("legend ", col_var, " 1")]] = leg
+        pl[[plot_name]] = p
+        
+      }
+    }
+  }
+  
+  #only make plots colored by col_var if the variable contains non-NA
+  if(!(plot_data[,col_var] %>% is.na() %>% all())){
+  
+    #combine plots on page
+    p <- eval(parse(text = paste0(
+                        "ggarrange(", 
+                        paste(
+                          
+                          #paste0("plot_list[['samples']][['", grep(col_var, names(plot_list[["samples"]]), value=T),"']]"
+                          paste0("pl[['", names(pl),"']]"
+                                 ), 
+                          collapse = ", "
+                        ), ", leg",
+                        ", nrow=5, ncol=", ceiling(length(grep(col_var, names(plot_list[["samples"]])))/5), ", widts=1, heights=1)")
+    )) +  plot_annotation(title = col_var, 
+                      subtitle = footnote,
+                      caption = Sys.Date(),
+                      theme = theme(plot.title=element_text(size=20),
+            plot.subtitle=element_text(size=10, color="grey40"),
+            legend.title = element_blank()))
+    
+    plot(p)
+  }
+}
+
+dev.off()
+
+
+           
+```
+
+# Extract selected plots and corresponding classifications
+
+For UMAP, a plot representing the collection of plots is manually selected. A threshold for defining samples as sero-positive or negative is also set manually based on visual inspection of the plot.
+
+Note:   
+Be aware that it may be necessary to update this code if input data is changed.   
+The following are manually selected based on visual inspection of PCA and UMAP plots:   
+- Selected representative UMAP plot   
+- Cutoffs for distinguishing positive and negative individuals   
+
+```{r extract_selected_plots, eval=T}
+
+#output file for plots
+pdf(file=paste0(plot_prefix, "_samples_selected_plots.pdf"), height=5, width=12)
+
+#--- selection of umap hyperparameter combinations
+
+# batch 1
+if(data_set == "batch1"){
+  
+  if(detection_ab == "IgG"){
+    neighbors = 158
+    min_dist = 0.01
+    seed = 254
+    
+    positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                    .[.[,"V2"] < -10,] %>% 
+                    rownames()
+    
+  } else if(detection_ab == "IgM"){
+    neighbors = 158
+    min_dist = 0.1
+    seed = 254
+    
+    positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                    .[.[,"V2"] > 4,] %>% 
+                    rownames()
+    
+  } else if(detection_ab == "IgM_IgG" | detection_ab == "IgG_IgM"){
+    neighbors = 25
+    min_dist = 0.5
+    seed = 42
+    
+    positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                    .[.[,"V2"] < -5,] %>% 
+                    rownames()
+  }
+  
+#batch 2
+} else if(data_set == "batch2"){
+    
+    if(detection_ab == "IgG"){
+      neighbors = 27
+      min_dist = 0.5
+      seed = 254
+      
+      positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                      .[.[,"V2"] < -5,] %>% 
+                      rownames()
+      
+    } else if (detection_ab == "IgM"){
+      neighbors = 27
+      min_dist = 0.5
+      seed = 59
+      
+      positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                      .[.[,"V1"] > 3,] %>% 
+                      rownames()
+      
+    } else if(detection_ab == "IgM_IgG" | detection_ab == "IgG_IgM"){
+      neighbors = 27
+      min_dist = 0.5
+      seed = 254
+      
+      positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                      .[.[,"V2"] < -5,] %>% 
+                      rownames()
+    }
+
+#cbc03
+} else if(data_set == "cbc03"){
+   
+  if(detection_ab == "IgG"){
+      neighbors = 9
+      min_dist = 0.5
+      seed = 42
+
+      positives = dim_reds[["samples"]][["umap"]][[paste0("n_neighbors: ", neighbors, ", min_dist: ", min_dist,", seed: ", seed)]] %>% 
+                      .[.[,"V2"] > 0,] %>% 
+                      rownames()
+    }
+}
+
+#add column to sinfo with positivity status
+sinfo <- sinfo %>%
+          mutate(!!paste0("umap_seropositive_", detection_ab) := ifelse(.$id %in% positives, 1, 0))
+
+# write out table with umap based sero-positive status
+write.table(sinfo %>% .[,c("id","subj.id",paste0("umap_seropositive_", detection_ab))], file = paste0(plot_prefix, "_seropositivity.txt"))
+
+#--- plotting
+
+#loop through variables to colur by
+for(col_var in samp_col_vars){
+  
+  #pca
+  a <- plot_list[["samples"]][[paste0("pca ", col_var, " 1")]]
+
+  #umap   
+  b <- plot_list[["samples"]][[paste0("umap ", col_var, " n_neighbors: ",neighbors, ", min_dist: ", min_dist, ", seed: ", seed)]]
+  
+  #legend
+  leg <- plot_list[["samples"]][[paste0("legend ", col_var, " 1")]]
+  
+  #combine plots, dont' include legend for samp
+  if(col_var %in% c("id","subj.id")) {
+    p <- ggarrange(a, b, nrow=1, ncol=3)  
+  } else{
+    p <- ggarrange(a, b, leg, nrow=1, ncol=3)  
+  }
+  
+  #add annotation
+  p <- p + plot_annotation(title = col_var, 
+                      subtitle = footnote,
+                      caption = Sys.Date(),
+                      theme = theme(plot.title=element_text(size=20),
+            plot.subtitle=element_text(size=10, color="grey40"),
+            legend.title = element_blank()))
+  
+  plot(p)
+  
+  #save plot to plot in report
+  if(col_var == "subj_status"){
+    plot_to_show <- p
+  }
+  
+}
+  
+dev.off()
+
+
+```
+
+
+```{r show_sample_example }
+  plot(plot_to_show)
+  #plot(plot_list[["samples"]][["pca sample_type 1"]])
+```
+
+## Binders
+
+OBS: This code is not run.
+No results from this code has been included in manuscript (as of 2020/07/14) and the code has not been updated recently and might therefore not work properly.
+
+```{r plot_probes, echo=F, eval=F}
+
+#variables to color samples by
+probe_col_vars = c("Coupling_chemistry","detect_Ab","Binder")
+
+#--- Plotting
+
+#list for storing plots
+plot_list = list()
+
+#loop through dimensionality reduction methods
+for(method in names(dim_reds[["probes"]])){
+  
+  #output file for plots
+  pdf(file=paste0(plot_prefix, "_", method, "_probes.pdf"), onefile=T)
+  
+  #define coordinates
+  plot_data = dim_reds[["probes"]][[method]] %>%
+                as_tibble() %>%
+                mutate(id = dim_reds[["probes"]][[method]] %>% rownames()) %>%
+                left_join(., binder, by="id")
+  
+  #loop through variables to plot by
+  for(col_var in probe_col_vars){
+    
+    p <- ggplot(plot_data, aes_string(x="PC1", y="PC2", color=col_var)) +
+      geom_point(alpha=0.5) +
+      labs(title = paste0(toupper(method), ", ", col_var), 
+           subtitle = footnote,
+           caption = Sys.Date()) +
+      theme(plot.subtitle=element_text(size=7, hjust=0.5, color="grey40"),
+            legend.title = element_blank())
+    
+    #if there is a large number of categories, put the legend under the plot and make it smaller
+    if(plot_data[,col_var] %>% unique() %>% nrow() > 10){
+      p <- p +
+            theme(legend.position="bottom", legend.title = element_text(size=5), legend.text = element_text(size=5))
+
+    }
+
+    plot(p)
+    
+    plot_list[[paste(method, col_var, sep="_")]] = p
+
+  }
+
+  dev.off()   
+  
+         
+}          
+
+
+```
+
+```{r show_binder_example, eval = F}
+plot(plot_list[["pca_Binder"]])
+```
+
+
+
+# Session information
+
+\footnotesize
+```{r session_info, eval=T, echo=F}
+sessionInfo()
+
+```
+\normalsize
