@@ -1,0 +1,487 @@
+---
+title: "anal-cbc03-seropos_prop"
+author: "Mun-Gwan"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: 
+  html_document:
+    theme: readable
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    fig_caption: true
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "../results/sero_positive_by_sd") })
+---
+
+<style>
+p.caption {
+  font-size: 1em;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = F,
+	dev = c('png', 'pdf'),
+	fig.path = '../results/sero_positive_by_sd/figures/',  # save figure in files
+	results = 'asis'
+)
+
+library(tidyverse)
+library(Useful2me)  # remotes::install_github("Rundmus/Useful2me-R_package", upgrade= "never")
+library(knitr)
+library(kableExtra)     # kable_styling
+library(UpSetR)
+library(table1)
+
+# library(janitor)     # tabyl, fisher.test
+
+rm(list = ls())
+
+
+###  File names
+
+source("options_master_trans_serology.R")
+# setwd("~/covid19_serology/scripts")
+
+fn <- list(
+	i = list(                               #  input
+		cbc3 = data_file_path_cbc03,
+		binder = '../data/assay_information/bead_id_information/CBA5_information_js_matching.csv',
+		umap = '../results/dim_reduction_plots/cbc03/luminex/2020-07-17_dim_red_dbs_covid19_manuscript_cbc03_cba_v1_detectionAb_IgG_seropositivity.txt'
+	)
+)
+
+#  Check all exists
+stopifnot(all(file.exists(c('.', unlist(fn$i)))))
+
+
+###  Load data
+
+tmp <- load(fn$i$cbc3)
+bBs0 <- list(
+	sinfo = sinfo,
+	mfi = mfi,
+	binder = binder
+)
+rm(list = tmp)
+
+bBs <- bBs0
+
+
+cbas <- read_csv(
+	fn$i$binder,
+	col_types = cols_only(
+		# CBA_nr = col_character(),
+		# Binder = col_character(),
+		# Comment = col_character(),
+		Bead_ID = col_character(),
+		# Coupling_chemistry = col_character(),
+		Name = col_character(),
+		# Provider = col_character(),
+		# `Edsberg Analysis` = col_character(),
+		`In batch 1` = col_character(),
+		`Batch 2 Analysis` = col_character(),
+		Match_Batch_1 = col_character()
+	)
+)
+stopifnot(anyDuplicated(cbas$Name) == 0)
+
+
+umap0 <- read.delim(
+	fn$i$umap,
+	sep= " ",
+	stringsAsFactors = F
+) %>% 
+	as_tibble()
+umap <- umap0 %>% 
+	mutate(
+		UMAP = if_else(
+			umap_seropositive_IgG == 1L,
+			TRUE,
+			FALSE
+		)
+	) %>% 
+	select(-umap_seropositive_IgG)
+
+##  CONSTANTS
+
+SERONEG_PROP = 0.8    # assumed sero-negative proportion 
+PREVALENCE = 0.1      # assumed the prevalence of Covid-19
+SD_CUTOFF = 6
+```
+
+```{r sinfo_umap}
+
+stopifnot(anyDuplicated(umap$id) == 0)
+
+bBs$sinfo <- bBs0$sinfo %>% 
+	left_join(umap, by= c("id", "subj.id")) %>% 
+	mutate(
+		subj.id_subtype = paste(subj.id, subtype),
+		subtype = if_else(duplicated(subj.id_subtype), paste0(subtype, "2"), subtype)
+	) %>% 
+	select(-subj.id_subtype)
+	
+stopifnot(all(!is.na(bBs$sinfo$UMAP)))
+```
+
+###  UMAP seropositivity
+
+
+```{r umap_seropos}
+
+bBs$sinfo %>% 
+	group_by(subtype) %>% 
+	summarise(
+		n = n(),
+		n_pos = sum(UMAP),
+		pos_prop = n_pos / n()
+	) %>% 
+	dplyr::select(-n_pos) %>% 
+	# pivot_wider(names_from = subtype, values_from = pos_prop)# %>% 
+	dplyr::select(
+		n,
+		Subtype = subtype, 
+		"Pos. prop." = pos_prop 
+	) %>% 
+	mutate(
+		#  P +- dev
+		dev = sqrt(`Pos. prop.` * (1 - `Pos. prop.`) / n) * -qnorm(0.025),
+		#  lower bound of CI
+		lower = `Pos. prop.` - dev,
+		lower = if_else(lower < 0, 0, lower),
+		#  upper bound of CI
+		upper = `Pos. prop.` + dev
+	) %>%
+	dplyr::select(-n) %>% 
+	#  Change to "0.00%" character
+	mutate_at(
+		c("Pos. prop.", "lower", "upper"),
+		function(x) {
+			if_else(
+				is.na(x),
+				"",
+				(x * 100) %>% 
+					round(., 2) %>% 
+					format(width = 5) %>% 
+					paste0(., "%")
+			)
+		}
+	) %>% 
+	mutate(
+		`95% CI` = paste0(lower, "-", upper)
+	) %>% 	
+	#  Change to "00%" character
+	mutate_if(
+		is.numeric,
+		function(x) {
+			if_else(
+				is.na(x),
+				"",
+				(x * 100) %>% 
+					round() %>% 
+					format(width = 5) %>% 
+					paste0(., "%")
+			)
+		}
+	) %>% 
+	dplyr::select(
+		Subtype,
+		`Pos. prop.`, 
+		`95% CI`
+	) %>% 
+	kable(caption = paste0("Seropositves")) %>% 
+	kable_styling(full_width = F) %>% 
+	print()
+```
+
+*  `Plasma` and `cDBS` are used. All other sample types were neglected.
+
+```{r}
+bBs <- lapply(
+	list("cDBS", "Plasma") %>% `names<-`(., .),
+	function(ii) {
+		list(
+			sinfo = bBs$sinfo %>% 
+				filter(subtype == ii),
+			mfi = bBs$mfi[bBs$sinfo$subtype == ii, ],
+			binder = bBs$binder
+		)
+	}
+)
+```
+
+
+##  6 Std.Dev from the peak (like CBC-01)
+
+```{r}
+
+##  Sero-positive or not (T or F) matrix
+posneg <- lapply(names(bBs) %>% `names<-`(., .), function(iset) {
+	#  No duplicated CBC+03 samples
+	stopifnot(
+		anyDuplicated(
+			bBs[[iset]]$sinfo$subj.id[grepl("CBC\\+", bBs[[iset]]$sinfo$subj.id)]
+		) == 0
+	)
+
+	subj.id <- bBs[[iset]]$sinfo$subj.id
+	id <- bBs[[iset]]$sinfo$id
+	UMAP <- bBs[[iset]]$sinfo$UMAP
+	
+	#  Finding cutoff ---------------------------------------------------------
+
+	mfi_pop <- bBs[[iset]]$mfi %>% 
+		as_tibble()
+
+	##  Based on peak value
+	den <- mfi_pop %>%
+		lapply(density)
+
+	#  peak
+	m <- sapply(den, function(x) x$x[which.max(x$y)])
+
+	#  std.dev. of (SERONEG_PROP) around the peak
+	s <- sapply(seq(m), function(ii) {
+		df <- abs(mfi_pop[[ii]] - m[ii])
+		qtl <- quantile(df, probs = c(SERONEG_PROP))
+		sd(mfi_pop[[ii]][df <= qtl])
+	})
+
+
+	#  Cutoff = peak + 6 * std.dev. of (SERONEG_PROP) around the peak
+	cutoff <- m + 6 * s
+	
+	#  Positve = TRUE, Negative = FALSE
+	truefalse <- function(coff, mat) {
+		rep(coff, each= nrow(mat)) %>%
+			matrix(., nrow= nrow(mat)) %>%
+			{mat > .} %>%
+			as_tibble()
+	}
+	
+	truefalse(cutoff, bBs[[iset]]$mfi) %>%
+		mutate(sample_id = id, subj.id = subj.id, UMAP = UMAP) %>%
+		dplyr::select(sample_id, subj.id, UMAP, everything())
+})
+```
+
+###  Tables
+
+```{r table}
+for(iset in names(posneg)) {
+	
+	out <- posneg[[iset]] %>% 
+		
+		pivot_longer(-c(sample_id, subj.id, UMAP), names_to = "id") %>%
+		group_by(id) %>%
+		summarise(
+			Sero_pos = sum(value),        # sero-positive
+			Non_reac = sum(!value)        # non-reactive (= sero-negative)
+		) %>%
+		mutate(
+			#  Add binder info
+			i_match = match(id, bBs[[iset]]$binder$id),
+			Binder = bBs[[iset]]$binder$Binder[i_match],
+			Name = bBs[[iset]]$binder$Name[i_match],
+			det_ab = bBs[[iset]]$binder$detect_Ab[i_match],
+			#  Positive proportion
+			pos_prop = Sero_pos / (Sero_pos + Non_reac)
+		) %>%
+		dplyr::select(-i_match) %>% 
+		arrange(det_ab) %>% 
+		ungroup() 
+	
+	out1 <- out %>% 
+		select(id, pos_prop) %>% 
+		rename("Pos. prop." = pos_prop) %>% 
+		mutate(
+			#  P +- dev
+			dev = sqrt(`Pos. prop.` * (1 - `Pos. prop.`) / nrow(posneg[[iset]])) * -qnorm(0.025),
+			#  lower bound of CI
+			lower = `Pos. prop.` - dev,
+			lower = if_else(lower < 0, 0, lower),
+			#  upper bound of CI
+			upper = `Pos. prop.` + dev
+		) %>% 
+		#  Change to "0.00%" character
+		mutate_at(
+			c("Pos. prop.", "lower", "upper"),
+			function(x) {
+				if_else(
+					is.na(x),
+					"",
+					(x * 100) %>% 
+						round(., 2) %>% 
+						format(width = 5) %>% 
+						paste0(., "%")
+				)
+			}
+		) %>% 
+		mutate(
+			`95% CI` = paste0(lower, "-", upper)
+		) %>% 	
+		#  Change to "00%" character
+		mutate_if(
+			is.numeric,
+			function(x) {
+				if_else(
+					is.na(x),
+					"",
+					(x * 100) %>% 
+						round() %>% 
+						format(width = 5) %>% 
+						paste0(., "%")
+				)
+			}
+		)
+	
+	out %>% 
+		left_join(out1, by= "id") %>% 
+		dplyr::select(
+			"Detect Ab" = det_ab, 
+			Binder, 
+			Name,
+			`Pos. prop.`, 
+			`95% CI`,
+			'Pos.' = Sero_pos, 
+			'Neg.' = Non_reac
+		) %>% 
+		kable(caption = paste0("Seropositves in ", iset, " (Cutoff 6 S.D.)")) %>% 
+		kable_styling(full_width = F) %>% 
+		print()
+}
+```
+
+-----------------------------------
+
+###  UMAP
+
+* Wilcoxon test for `Age group` and `Flu-like symptom` to take into account the ordered categorical variables.
+* Fisher's exact test for `Sex` and `Breathing difficulty`
+
+```{r qnaire}
+for(iset in names(posneg)) {
+	cat("\n\n#####", iset, "\n\n")
+
+	# tg <- seropos_spk %>% 
+	# 	mutate(seropos = if_else(seropos, "Positive", "Negative") %>% 
+	# 				 	factor(levels = c("Positive", "Negative", 'P-value'))) %>% 
+	# 	left_join(tmp, by= c("id", "set")) %>% 
+	# 	filter(grp == "Population")
+	tg <- bBs[[iset]]$sinfo %>% 
+		mutate(
+			Age_grp = factor(Age_grp, ordered = T, 
+											 levels = c("20-29", "30-39", "40-49", "50-59", "60-69", "70-74")),
+			Breath = replace(Breath, Breath %in% c("Both", "Coughing", "Hard breat"), "Yes"),
+			UMAP = if_else(UMAP, "Positive", "Negative") %>% 
+				factor(levels = c("Positive", "Negative", 'P-value'))
+		)
+
+	label(tg$Age_grp) <- "Age group"
+	units(tg$Age_grp) <- "years"
+	label(tg$Breath) <- "Breathing difficulty"
+	label(tg$Symptom) <- "Flu-like symptom"
+	
+	rndr <- function(x, name, ...) {
+		if (length(x) == 0) {
+			y <- tg[[name]]
+			s <- rep("", length(render.default(x=y, name=name, ...)))
+			p <- if(is.ordered(y)) {
+				f <- formula(paste(name, "~ UMAP"))
+				tg1 <- tg %>% 
+					mutate(UMAP = droplevels(UMAP)) %>% 
+					mutate_at(name, as.integer)
+				wilcox.test(f, tg1, exact = F)$p.value
+			} else {
+				fisher.test(table(y, droplevels(tg$UMAP), useNA = "no"))$p.value
+			}
+			
+			s[2] <- sub("<", "&lt;", format.pval(p, digits=3, eps=0.001))
+			s
+		} else {
+			render.default(x=x, name=name, ...)
+		}
+	}
+	rndr.strat <- function(label, n, ...) {
+		ifelse(n==0, label, render.strat.default(label, n, ...))
+	}
+	
+	print(
+		table1(~ Sex + Age_grp + Symptom + Breath | UMAP, tg,
+					 droplevels=F, render= rndr, render.strat=rndr.strat, overall=F)
+	)
+}
+```
+
+####  Odds ratio
+
+```{r oddsratio}
+
+oddsratio <- function(x) {
+	x %>% 
+		as.data.frame() %>% 
+		pull(Freq) %>% 
+		{(.[1] * .[4]) / (.[2] * .[3])}
+}
+
+ortio <- lapply(names(bBs) %>% `names<-`(., .), function(iset) {
+	tg_sd_prot <- bBs[[iset]]$sinfo %>% 
+		mutate(UMAP = if_else(UMAP, "Positive", "Negative") %>% 
+				factor(levels = c("Positive", "Negative", 'P-value')))
+	
+	list(
+		Sex = tg_sd_prot %>% 
+			mutate(UMAP = droplevels(UMAP)) %>% 
+			filter(Sex %in% c("Female", "Male")) %>% 
+			{with(., table(Sex, UMAP))} %>% 
+			oddsratio %>% 
+			round(2),
+		Symptom = tg_sd_prot %>% 
+			mutate(
+				UMAP = droplevels(UMAP),
+				Symptom = sub("Yes[, [:alpha:]]*", "Yes", Symptom)
+			) %>% 
+			{with(., table(Symptom, UMAP))} %>% 
+			oddsratio %>% 
+			{1/.} %>% 
+			round(2),
+		Breath = tg_sd_prot %>% 
+			mutate(UMAP = droplevels(UMAP)) %>% 
+			{with(., table(Breath, UMAP))} %>% 
+			oddsratio %>% 
+			round(2)
+	)
+})
+```
+
+#####  cDBS
+
+* Sex : `r ortio$cDBS$Sex`  (odds for seropositive of 'Female' / odds of 'Male')
+
+* Symptom : `r ortio$cDBS$Symptom`  (odds of 'Yes' / odds of 'No')
+
+* Breath : `r ortio$cDBS$Breath` (odds of 'No' / odds of 'Yes')
+
+
+#####  Plasma
+
+* Sex : `r ortio$Plasma$Sex`  (odds for seropositive of 'Female' / odds of 'Male')
+
+* Symptom : `r ortio$Plasma$Symptom`  (odds of 'Yes' / odds of 'No')
+
+* Breath : `r ortio$Plasma$Breath` (odds of 'No' / odds of 'Yes')
+
+
+
+
+
+```{r sessionInfo, results='markup'}
+sessionInfo()
+```
+
+
+
+
